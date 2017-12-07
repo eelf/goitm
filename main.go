@@ -8,6 +8,9 @@ import (
 	"os/exec"
 	"io"
 	"crypto/tls"
+	"time"
+	"golang.org/x/net/proxy"
+	"bufio"
 )
 
 /*
@@ -27,6 +30,7 @@ type WritableLogger struct {
 
 var (
 	oidExtensionSubjectAltName        = []int{2, 5, 29, 17}
+	hostproxy map[string]bool
 )
 
 func (r *WritableLogger) Write(p []byte) (n int, err error) {
@@ -35,6 +39,21 @@ func (r *WritableLogger) Write(p []byte) (n int, err error) {
 }
 
 func main() {
+	hostproxy = make(map[string]bool)
+
+	file, err := os.Open("hostsproxy")
+	if err != nil {
+		b := bufio.NewReader(file)
+		for {
+			line, _, err := b.ReadLine()
+			if err != nil {
+				break
+			}
+			hostproxy[string(line)] = true
+		}
+	} else {
+		log.Println("could not open hostsproxy file", err)
+	}
 	s, err := net.Listen("tcp", "0:12345")
 	if err != nil {
 		panic(err)
@@ -66,8 +85,8 @@ func parsePfctl(out, addr string) (string, string) {
 }
 
 func client(c net.Conn) {
+	defer c.Close()
 	logger := &WritableLogger{log.New(os.Stdout, c.RemoteAddr().String() + ": ", 0)}
-	logger2 := &WritableLogger{log.New(os.Stdout, c.RemoteAddr().String() + ": ", 0)}
 	logger.Println("CONNECTED")
 	cmd := exec.Command("/sbin/pfctl", "-s", "state")
 	out, err := cmd.Output()
@@ -75,25 +94,65 @@ func client(c net.Conn) {
 		panic(err)
 	}
 	host, port := parsePfctl(string(out), c.RemoteAddr().String())
-
 	logger.Println("hostport", host, port)
 
-	u, err := net.Dial("tcp", host + ":" + port)
-	if err != nil {
-		panic(err)
-	}
-
-	if port != "443" {
-		logger.SetPrefix(logger.Prefix() + "u->c\n\n")
-		logger2.SetPrefix(logger2.Prefix() + "c->u\n\n")
-		tu := io.TeeReader(u, logger)
-		tc := io.TeeReader(c, logger2)
-
-		go io.Copy(c, tu)
-		io.Copy(u, tc)
+	u := connectToRemote(logger, host, port)
+	if u == nil {
 		return
 	}
 
+	doMitm := port == "443"
+	doMitm = false
+	if !doMitm {
+		proxyConn(u, c, port != "443", logger)
+	} else {
+		proxyCryptoConn(u, c, logger)
+	}
+}
+
+func connectToRemote(logger *WritableLogger, host, port string) (u net.Conn) {
+	var err error
+	if hostproxy[host] {
+		d, err := proxy.SOCKS5("tcp", "127.0.0.1:9150", nil, proxy.Direct)
+		if err != nil {
+			logger.Println("could not use socks5", err)
+			return nil
+		}
+		u, err = d.Dial("tcp", host + ":" + port)
+		if err != nil {
+			logger.Println("could not dial using socks5", host + ":" + port, err)
+			return nil
+		}
+	} else {
+		u, err = net.DialTimeout("tcp", host + ":" + port, 10 * time.Second)
+		if err != nil {
+			logger.Println("could not dial", host + ":" + port, err)
+			return nil
+		}
+	}
+	return u
+}
+
+func proxyConn(u, c net.Conn, withLog bool, logger *WritableLogger) {
+	var tu, tc io.Reader
+	if withLog {
+		logger2 := &WritableLogger{log.New(os.Stdout, c.RemoteAddr().String() + ": ", 0)}
+
+		logger.SetPrefix(logger.Prefix() + "u->c\n\n")
+		logger2.SetPrefix(logger2.Prefix() + "c->u\n\n")
+		tu = io.TeeReader(u, logger)
+		tc = io.TeeReader(c, logger2)
+	} else {
+		tu = u
+		tc = c
+	}
+
+	go io.Copy(c, tu)
+	io.Copy(u, tc)
+}
+
+func proxyCryptoConn(u, c net.Conn, logger *WritableLogger) {
+	var err error
 	config := &tls.Config{
 		InsecureSkipVerify: true,
 	}
